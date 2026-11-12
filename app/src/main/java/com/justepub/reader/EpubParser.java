@@ -4,12 +4,18 @@ import android.content.ContentResolver;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.ColorFilter;
+import android.graphics.Paint;
+import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.text.Html;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
+import android.util.LruCache;
 import android.util.Xml;
 
 import org.xmlpull.v1.XmlPullParser;
@@ -38,7 +44,15 @@ final class EpubParser {
     private static final int MAX_BOOK_TEXT_BYTES = 8 * 1024 * 1024;
     private static final int MAX_CHAPTER_BYTES = 4 * 1024 * 1024;
     private static final int MAX_IMAGE_BYTES = 6 * 1024 * 1024;
-    private static final int MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024;
+    private static final int MAX_TOTAL_IMAGE_BYTES = 40 * 1024 * 1024;
+    private static final int MAX_DECODED_IMAGE_CACHE_BYTES = 12 * 1024 * 1024;
+    private static final LruCache<String, Bitmap> DECODED_IMAGE_CACHE =
+            new LruCache<String, Bitmap>(MAX_DECODED_IMAGE_CACHE_BYTES) {
+                @Override
+                protected int sizeOf(String key, Bitmap value) {
+                    return value.getByteCount();
+                }
+            };
     private static final Pattern HIDDEN_BLOCKS = Pattern.compile(
             "(?is)<(script|style|head|svg|iframe|object)[^>]*>.*?</\\1\\s*>");
     private static final Pattern IMAGE_SOURCE = Pattern.compile(
@@ -186,7 +200,7 @@ final class EpubParser {
             if (html == null) continue;
             String safeHtml = HIDDEN_BLOCKS.matcher(html).replaceAll("");
             Html.ImageGetter imageGetter = source -> createImageDrawable(
-                    context, images, parentPath(path), source);
+                    context, images, uri.toString(), parentPath(path), source);
             Spanned chapter = android.os.Build.VERSION.SDK_INT >= 24
                     ? Html.fromHtml(safeHtml, Html.FROM_HTML_MODE_LEGACY, imageGetter, null)
                     : Html.fromHtml(safeHtml, imageGetter, null);
@@ -265,9 +279,10 @@ final class EpubParser {
     }
 
     private static Drawable createImageDrawable(Context context, Map<String, byte[]> images,
-                                                String chapterDirectory, String source) {
+                                                String bookId, String chapterDirectory, String source) {
         if (source == null || source.startsWith("data:")) return null;
-        byte[] bytes = images.get(resolvePath(chapterDirectory, source));
+        String imagePath = resolvePath(chapterDirectory, source);
+        byte[] bytes = images.get(imagePath);
         if (bytes == null || bytes.length == 0) return null;
 
         BitmapFactory.Options bounds = new BitmapFactory.Options();
@@ -285,18 +300,79 @@ final class EpubParser {
         int displayWidth = Math.max(1, Math.round(bounds.outWidth * scale));
         int displayHeight = Math.max(1, Math.round(bounds.outHeight * scale));
 
-        BitmapFactory.Options decode = new BitmapFactory.Options();
-        decode.inSampleSize = 1;
-        while (decode.inSampleSize < 8
-                && bounds.outWidth / (decode.inSampleSize * 2) >= displayWidth
-                && bounds.outHeight / (decode.inSampleSize * 2) >= displayHeight) {
-            decode.inSampleSize *= 2;
-        }
-        Bitmap bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length, decode);
-        if (bitmap == null) return null;
-        BitmapDrawable drawable = new BitmapDrawable(context.getResources(), bitmap);
+        String cacheKey = bookId + "\u0000" + imagePath;
+        Drawable drawable = new EpubImageDrawable(cacheKey, bytes, bounds.outWidth, bounds.outHeight);
         drawable.setBounds(0, 0, displayWidth, displayHeight);
         return drawable;
+    }
+
+    /** Decodes only when the image scrolls into view and keeps a small shared bitmap cache. */
+    private static final class EpubImageDrawable extends Drawable {
+        private final String cacheKey;
+        private final byte[] bytes;
+        private final int sourceWidth;
+        private final int sourceHeight;
+        private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);
+
+        EpubImageDrawable(String cacheKey, byte[] bytes, int sourceWidth, int sourceHeight) {
+            this.cacheKey = cacheKey;
+            this.bytes = bytes;
+            this.sourceWidth = sourceWidth;
+            this.sourceHeight = sourceHeight;
+        }
+
+        @Override
+        public void draw(Canvas canvas) {
+            Bitmap bitmap = DECODED_IMAGE_CACHE.get(cacheKey);
+            if (bitmap == null) {
+                bitmap = decodeForDisplay();
+                if (bitmap == null) return;
+                DECODED_IMAGE_CACHE.put(cacheKey, bitmap);
+            }
+            Rect bounds = getBounds();
+            canvas.drawBitmap(bitmap, null, bounds, paint);
+        }
+
+        private Bitmap decodeForDisplay() {
+            Rect bounds = getBounds();
+            int displayWidth = Math.max(1, bounds.width());
+            int displayHeight = Math.max(1, bounds.height());
+            float sampleRatio = Math.max(sourceWidth / (float) displayWidth,
+                    sourceHeight / (float) displayHeight);
+            int sampleSize = 1;
+            while (sampleSize < sampleRatio && sampleSize < 64) sampleSize <<= 1;
+
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inSampleSize = sampleSize;
+            return BitmapFactory.decodeByteArray(bytes, 0, bytes.length, options);
+        }
+
+        @Override
+        public int getIntrinsicWidth() {
+            return Math.max(1, getBounds().width());
+        }
+
+        @Override
+        public int getIntrinsicHeight() {
+            return Math.max(1, getBounds().height());
+        }
+
+        @Override
+        public void setAlpha(int alpha) {
+            paint.setAlpha(alpha);
+            invalidateSelf();
+        }
+
+        @Override
+        public void setColorFilter(ColorFilter colorFilter) {
+            paint.setColorFilter(colorFilter);
+            invalidateSelf();
+        }
+
+        @Override
+        public int getOpacity() {
+            return PixelFormat.TRANSLUCENT;
+        }
     }
 
     private static PackageInfo parsePackage(String xml) throws Exception {
