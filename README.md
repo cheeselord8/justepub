@@ -7,7 +7,8 @@ A small, offline EPUB reader for Android. JustEpub keeps a local library of the 
 - Import one or more `.epub` files using Android's document picker.
 - Keep a library of selected files without requesting broad storage access.
 - Read EPUB 2 and EPUB 3 text with a black interface and adjustable text size.
-- Resume from the last scroll position for each book.
+- Resume each book at the same text position, including after relaunching the app or changing text size.
+- Display embedded PNG, JPEG, GIF, WebP, and BMP illustrations inline while reading.
 - Remove a book from the library by long-pressing it.
 - No account, network permission, analytics, ads, or animations.
 
