@@ -2,6 +2,10 @@ package com.justepub.reader;
 
 import android.content.ContentResolver;
 import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.text.Html;
 import android.text.SpannableStringBuilder;
@@ -20,8 +24,10 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -31,8 +37,12 @@ final class EpubParser {
     private static final int MAX_PACKAGE_BYTES = 2 * 1024 * 1024;
     private static final int MAX_BOOK_TEXT_BYTES = 8 * 1024 * 1024;
     private static final int MAX_CHAPTER_BYTES = 4 * 1024 * 1024;
+    private static final int MAX_IMAGE_BYTES = 6 * 1024 * 1024;
+    private static final int MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024;
     private static final Pattern HIDDEN_BLOCKS = Pattern.compile(
             "(?is)<(script|style|head|svg|iframe|object)[^>]*>.*?</\\1\\s*>");
+    private static final Pattern IMAGE_SOURCE = Pattern.compile(
+            "(?is)<img\\b[^>]*?\\bsrc\\s*=\\s*(['\"])(.*?)\\1");
 
     static final class Metadata {
         final String title;
@@ -167,14 +177,19 @@ final class EpubParser {
             throw new IllegalArgumentException("No readable chapters were found in this EPUB.");
         }
 
+        Set<String> imagePaths = findImagePaths(chapterPaths, documents);
+        Map<String, byte[]> images = readReferencedImages(context, uri, imagePaths);
+
         SpannableStringBuilder bookText = new SpannableStringBuilder();
         for (String path : chapterPaths) {
             String html = documents.get(path);
             if (html == null) continue;
             String safeHtml = HIDDEN_BLOCKS.matcher(html).replaceAll("");
+            Html.ImageGetter imageGetter = source -> createImageDrawable(
+                    context, images, parentPath(path), source);
             Spanned chapter = android.os.Build.VERSION.SDK_INT >= 24
-                    ? Html.fromHtml(safeHtml, Html.FROM_HTML_MODE_LEGACY)
-                    : Html.fromHtml(safeHtml);
+                    ? Html.fromHtml(safeHtml, Html.FROM_HTML_MODE_LEGACY, imageGetter, null)
+                    : Html.fromHtml(safeHtml, imageGetter, null);
             String plain = chapter.toString().trim();
             if (plain.isEmpty()) continue;
             if (bookText.length() > 0) bookText.append("\n\n\n");
@@ -192,6 +207,96 @@ final class EpubParser {
         }
         Metadata metadata = new Metadata(packageInfo.title, packageInfo.author);
         return new BookContent(metadata, bookText);
+    }
+
+    private static Set<String> findImagePaths(List<String> chapterPaths, Map<String, String> documents) {
+        Set<String> paths = new LinkedHashSet<>();
+        for (String chapterPath : chapterPaths) {
+            String html = documents.get(chapterPath);
+            if (html == null) continue;
+            java.util.regex.Matcher matcher = IMAGE_SOURCE.matcher(html);
+            while (matcher.find()) {
+                String source = matcher.group(2).trim();
+                String lower = source.toLowerCase();
+                if (source.isEmpty() || lower.startsWith("data:") || lower.startsWith("http:")
+                        || lower.startsWith("https:") || lower.startsWith("//")) continue;
+                String path = resolvePath(parentPath(chapterPath), source);
+                if (isSupportedImage(path)) paths.add(path);
+            }
+        }
+        return paths;
+    }
+
+    private static boolean isSupportedImage(String path) {
+        String lower = path.toLowerCase();
+        return lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+                || lower.endsWith(".gif") || lower.endsWith(".webp") || lower.endsWith(".bmp");
+    }
+
+    private static Map<String, byte[]> readReferencedImages(Context context, Uri uri,
+                                                            Set<String> imagePaths) throws Exception {
+        Map<String, byte[]> images = new HashMap<>();
+        if (imagePaths.isEmpty()) return images;
+        int totalBytes = 0;
+        try (InputStream source = context.getContentResolver().openInputStream(uri);
+             ZipInputStream zip = new ZipInputStream(source)) {
+            ZipEntry entry;
+            while ((entry = zip.getNextEntry()) != null) {
+                if (entry.isDirectory()) continue;
+                if (!imagePaths.contains(entry.getName())
+                        || totalBytes >= MAX_TOTAL_IMAGE_BYTES) {
+                    skipEntry(zip);
+                } else {
+                    try {
+                        byte[] bytes = readEntryBytes(zip, MAX_IMAGE_BYTES);
+                        if (totalBytes + bytes.length <= MAX_TOTAL_IMAGE_BYTES) {
+                            images.put(entry.getName(), bytes);
+                            totalBytes += bytes.length;
+                        }
+                    } catch (IllegalArgumentException tooLarge) {
+                        // Ignore an oversized illustration and continue with the rest of the book.
+                        skipEntry(zip);
+                    }
+                }
+                zip.closeEntry();
+            }
+        }
+        return images;
+    }
+
+    private static Drawable createImageDrawable(Context context, Map<String, byte[]> images,
+                                                String chapterDirectory, String source) {
+        if (source == null || source.startsWith("data:")) return null;
+        byte[] bytes = images.get(resolvePath(chapterDirectory, source));
+        if (bytes == null || bytes.length == 0) return null;
+
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
+
+        float density = context.getResources().getDisplayMetrics().density;
+        int maxWidth = Math.max(1, context.getResources().getDisplayMetrics().widthPixels
+                - Math.round(48 * density));
+        int maxHeight = Math.max(1, context.getResources().getDisplayMetrics().heightPixels
+                - Math.round(220 * density));
+        float scale = Math.min(1f, Math.min(maxWidth / (float) bounds.outWidth,
+                maxHeight / (float) bounds.outHeight));
+        int displayWidth = Math.max(1, Math.round(bounds.outWidth * scale));
+        int displayHeight = Math.max(1, Math.round(bounds.outHeight * scale));
+
+        BitmapFactory.Options decode = new BitmapFactory.Options();
+        decode.inSampleSize = 1;
+        while (decode.inSampleSize < 8
+                && bounds.outWidth / (decode.inSampleSize * 2) >= displayWidth
+                && bounds.outHeight / (decode.inSampleSize * 2) >= displayHeight) {
+            decode.inSampleSize *= 2;
+        }
+        Bitmap bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length, decode);
+        if (bitmap == null) return null;
+        BitmapDrawable drawable = new BitmapDrawable(context.getResources(), bitmap);
+        drawable.setBounds(0, 0, displayWidth, displayHeight);
+        return drawable;
     }
 
     private static PackageInfo parsePackage(String xml) throws Exception {
