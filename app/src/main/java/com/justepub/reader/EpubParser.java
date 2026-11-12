@@ -41,7 +41,8 @@ import java.util.zip.ZipInputStream;
 /** Small EPUB 2/3 reader for the library and reading screen. */
 final class EpubParser {
     private static final int MAX_PACKAGE_BYTES = 2 * 1024 * 1024;
-    private static final int MAX_BOOK_TEXT_BYTES = 8 * 1024 * 1024;
+    private static final int MAX_BOOK_DOCUMENT_BYTES = 16 * 1024 * 1024;
+    private static final int MAX_BOOK_TEXT_LENGTH = 8 * 1024 * 1024;
     private static final int MAX_CHAPTER_BYTES = 4 * 1024 * 1024;
     private static final int MAX_IMAGE_BYTES = 6 * 1024 * 1024;
     private static final int MAX_TOTAL_IMAGE_BYTES = 40 * 1024 * 1024;
@@ -136,7 +137,7 @@ final class EpubParser {
                         || lower.endsWith(".html") || lower.endsWith(".htm")) {
                     byte[] bytes = readEntryBytes(zip, MAX_CHAPTER_BYTES);
                     totalBytes += bytes.length;
-                    if (totalBytes > MAX_BOOK_TEXT_BYTES) {
+                    if (totalBytes > MAX_BOOK_DOCUMENT_BYTES) {
                         throw new IllegalArgumentException("This EPUB is too large to open in JustEpub.");
                     }
                     documents.put(name, new String(bytes, StandardCharsets.UTF_8));
@@ -212,7 +213,7 @@ final class EpubParser {
             while (bookText.length() > offset && Character.isWhitespace(bookText.charAt(bookText.length() - 1))) {
                 bookText.delete(bookText.length() - 1, bookText.length());
             }
-            if (bookText.length() > MAX_BOOK_TEXT_BYTES) {
+            if (bookText.length() > MAX_BOOK_TEXT_LENGTH) {
                 throw new IllegalArgumentException("This EPUB contains too much text to display.");
             }
         }
