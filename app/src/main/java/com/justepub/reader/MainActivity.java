@@ -10,10 +10,14 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.OpenableColumns;
+import android.text.Layout;
 import android.text.TextUtils;
 import android.util.TypedValue;
-import android.view.Gravity;import android.view.View;
+import android.view.Gravity;
+import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
 import android.view.WindowInsets;
@@ -46,6 +50,8 @@ public class MainActivity extends Activity {
 
     private final ArrayList<Book> books = new ArrayList<>();
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final Handler saveHandler = new Handler(Looper.getMainLooper());
+    private final Runnable savePositionRunnable = this::saveReadingPosition;
     private SharedPreferences preferences;
     private LinearLayout root;
     private Book currentBook;
@@ -283,21 +289,24 @@ public class MainActivity extends Activity {
         readerText.setTextIsSelectable(true);
         readerText.setPadding(dp(1), dp(22), dp(1), dp(52));
         readerScroll.addView(readerText, params(-1, -2));
+        readerScroll.setOnScrollChangeListener((view, scrollX, scrollY, oldScrollX, oldScrollY) ->
+                scheduleSaveReadingPosition());
         LinearLayout.LayoutParams scrollParams = new LinearLayout.LayoutParams(-1, 0, 1);
         scrollParams.topMargin = dp(2);
         root.addView(readerScroll, scrollParams);
-        int savedPosition = preferences.getInt(progressKey(book), 0);
-        readerScroll.post(() -> readerScroll.scrollTo(0, savedPosition));
+        readerScroll.post(() -> restoreReadingPosition(book));
 
         // Keep the current size visible and update it when the reader controls change.
         size.setTag("reader-size-label");
     }
 
     private void changeFontSize(int amount) {
+        int savedOffset = currentCharacterOffset();
         fontSize = Math.max(14, Math.min(34, fontSize + amount));
         preferences.edit().putInt("font_size", fontSize).apply();
         if (readerText != null) {
             readerText.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSize);
+            readerScroll.post(() -> restoreCharacterOffset(savedOffset));
             updateSizeLabel();
         }
     }
@@ -453,12 +462,58 @@ public class MainActivity extends Activity {
     }
 
     private void saveReadingPosition() {
+        saveHandler.removeCallbacks(savePositionRunnable);
         if (readerOpen && currentBook != null && readerScroll != null) {
-            preferences.edit().putInt(progressKey(currentBook), readerScroll.getScrollY()).apply();
+            Layout layout = readerText == null ? null : readerText.getLayout();
+            if (layout != null) {
+                preferences.edit().putInt(progressKey(currentBook), currentCharacterOffset()).apply();
+            }
         }
     }
 
+    private void scheduleSaveReadingPosition() {
+        saveHandler.removeCallbacks(savePositionRunnable);
+        saveHandler.postDelayed(savePositionRunnable, 300);
+    }
+
+    private int currentCharacterOffset() {
+        if (readerText == null || readerScroll == null) return 0;
+        Layout layout = readerText.getLayout();
+        if (layout == null || layout.getLineCount() == 0) return 0;
+        int textY = Math.max(0, readerScroll.getScrollY() - readerText.getTotalPaddingTop());
+        int line = Math.max(0, Math.min(layout.getLineCount() - 1, layout.getLineForVertical(textY)));
+        return layout.getLineStart(line);
+    }
+
+    private void restoreReadingPosition(Book book) {
+        if (readerScroll == null || readerText == null || readerText.getLayout() == null) return;
+        int offset = preferences.getInt(progressKey(book), -1);
+        if (offset >= 0) {
+            restoreCharacterOffset(offset);
+        } else {
+            // Migrate the previous release's saved pixel position to a text anchor.
+            int oldScrollY = preferences.getInt(legacyProgressKey(book), 0);
+            readerScroll.scrollTo(0, oldScrollY);
+            saveReadingPosition();
+        }
+    }
+
+    private void restoreCharacterOffset(int offset) {
+        if (readerScroll == null || readerText == null) return;
+        Layout layout = readerText.getLayout();
+        if (layout == null || layout.getLineCount() == 0) return;
+        int safeOffset = Math.max(0, Math.min(readerText.length(), offset));
+        int line = layout.getLineForOffset(safeOffset);
+        int scrollY = readerText.getTotalPaddingTop() + layout.getLineTop(line);
+        readerScroll.scrollTo(0, scrollY);
+        saveReadingPosition();
+    }
+
     private String progressKey(Book book) {
+        return "reader_offset:" + book.uri;
+    }
+
+    private String legacyProgressKey(Book book) {
         return "position:" + book.uri;
     }
 
